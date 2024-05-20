@@ -1,0 +1,64 @@
+#!/usr/bin/env bpftrace
+/*
+ * biosnoop.bt   Block I/O tracing tool, showing per I/O latency.
+ *               For Linux, uses bpftrace, eBPF.
+ *
+ *
+ * This is a bpftrace version of the bcc tool of the same name.
+ *
+ * 10-Dec-2023	Costa Shulyupin	Switched to block tracepoints.
+ * 15-Nov-2017	Brendan Gregg	Created this.
+ */
+
+
+BEGIN
+{
+	printf("%-12s %-7s %-16s %-6s %-16s %-4s %7s\n", "TIME(ms)", "DEVICE", "COMM", "PID", "TYPE","SIZE(kb)","LAT(us)");
+}
+
+tracepoint:block:block_bio_queue
+{       
+        // filter for droplet processes (qemu, ...)
+        if (strncmp(comm, "qemu-system-x86", 10) != 0 && strncmp(comm,"kworker",4) != 0) {
+           return
+        }
+   
+        // example: filter for vertain pid
+        //if (pid != 2643330) {
+        //  return
+        //}
+      
+           
+	@start[args->dev, args->sector] = nsecs;
+	@iopid[args->dev, args->sector] = pid;
+	@iocomm[args->dev, args->sector] = comm;
+}
+
+/*
+* via /@start[..]/ filters events that have no corresponding start-enrty in the bpf map
+*/
+tracepoint:block:block_rq_complete,
+tracepoint:block:block_bio_complete
+/@start[args->dev, args->sector]/
+{
+	printf("%-12u %4d:%-2d %-16s %-6d %-16s   %llu %7d\n",
+		elapsed / 1e6,
+		// like MAJOR(dev), MINOR(dev):
+		args->dev >> 20, args->dev & 0xfffff,
+		@iocomm[args->dev, args->sector],
+		@iopid[args->dev, args->sector],
+                args->rwbs,
+                (args->nr_sector*512)/1e3,
+		(nsecs - @start[args->dev, args->sector]) / 1e3);
+
+	delete(@start[args->dev, args->sector]);
+	delete(@iopid[args->dev, args->sector]);
+	delete(@iocomm[args->dev, args->sector]);
+}
+
+END
+{
+	clear(@start);
+	clear(@iopid);
+	clear(@iocomm);
+}
