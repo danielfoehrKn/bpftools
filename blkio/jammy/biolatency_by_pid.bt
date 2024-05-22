@@ -11,6 +11,7 @@
  * 13-Sep-2018	Brendan Gregg	Created this.
  * 
  * Daniel: block I/O latency by PID
+ * - tested for both Kernels 6.6.12 and 5.10.53
  */
 
 BEGIN
@@ -28,6 +29,9 @@ tracepoint:block:block_rq_complete,
 tracepoint:block:block_bio_complete
 /@start[args->sector, args->dev]/
 {
+        // optionally, have histogram by (pid,device_major,device_minor)
+	//@[comm,args->dev >> 20, args->dev & 0xfffff] = hist((nsecs - @start[args->sector, args->dev]) / 1000);
+
 	@[comm] = hist((nsecs - @start[args->sector, args->dev]) / 1000);
 }
 

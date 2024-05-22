@@ -8,7 +8,10 @@
  *
  * 10-Dec-2023	Costa Shulyupin	Switched to block tracepoints.
  * 15-Nov-2017	Brendan Gregg	Created this.
+ * 20-May-2024  Daniel customized 
+ * NOTE:  "block_bio_queue" and "block_bio_complete" are available in both 5.X and 6.X kernels, while "request layer" tracepoints "block_io_start"/"block_io_done" are only available in 6.X kernels
  */
+
 
 
 BEGIN
@@ -16,12 +19,16 @@ BEGIN
 	printf("%-12s %-7s %-16s %-6s %-16s %-4s %7s\n", "TIME(ms)", "DEVICE", "COMM", "PID", "TYPE","SIZE(kb)","LAT(us)");
 }
 
+/*  When a new `bio` is submitted to the block layer (specifically the `bio` layer) by the filesystem. No request enqueued in 
+ *  per-device queue yet (that's tracked by the "block_io_start" tracepoint, only available in 6.X kernel)
+ *  - format of tracepoint sudo cat /sys/kernel/tracing/events/block/block_bio_queue/format
+ */
 tracepoint:block:block_bio_queue
 {       
         // filter for droplet processes (qemu, ...)
-        if (strncmp(comm, "qemu-system-x86", 10) != 0 && strncmp(comm,"kworker",4) != 0) {
-           return
-        }
+       // if (strncmp(comm, "qemu-system-x86", 10) != 0 && strncmp(comm,"kworker",4) != 0) {
+       //    return
+        //}
    
         // example: filter for vertain pid
         //if (pid != 2643330) {
@@ -35,7 +42,11 @@ tracepoint:block:block_bio_queue
 }
 
 /*
-* via /@start[..]/ filters events that have no corresponding start-enrty in the bpf map
+* "block_rq_complete" is a "request layer" tracepoint when the device marks the request as done
+* "block_bio_complete" is a "block layer" tracepoint when the filesystem marks the `bio` as done (should happen shortly after "block_rq_complete")
+* - not sure why the original author traces both events
+* - /@start[..]/ filters events that have no corresponding start-enrty in the bpf map
+* format of tracepoint: sudo cat /sys/kernel/tracing/events/block/block_bio_complete/format
 */
 tracepoint:block:block_rq_complete,
 tracepoint:block:block_bio_complete

@@ -1,0 +1,102 @@
+#!/usr/bin/env bpftrace
+/*
+ * biosnoop.bt   Block I/O tracing tool, showing per I/O latency.
+ *               For Linux, uses bpftrace, eBPF.
+ *
+ *
+ * This is a bpftrace version of the bcc tool of the same name.
+ *
+ * 10-Dec-2023	Costa Shulyupin	Switched to block tracepoints.
+ * 15-Nov-2017	Brendan Gregg	Created this.
+ * 21-May-2014  Daniel Foehr added calculation of time queued in the per-device I/O queue (Block I/O Wait Time) (Q2I) and time executing on-device (Service time) (I2C)
+ *   - tested on Kernel 6.6.12
+ */
+
+
+BEGIN
+{
+        /* LEGEND 
+           Q2I = Queue bio till start execute/issue to device
+           I2C = Start execute/issue till completed execution
+           Latency = Q2C (Q2I + I2C). Total time filesystem enques I/O (bio struct) till request completion. Does not cover latency of higher levels such as VFS or filesystem.
+        */
+
+        // NOTE: needed those combined columns on printf due to stack restrictions. For whatever reason, adding another printf argument increased the stack size 
+        //  - only 512 bytes allowed, and printf copies string to stack
+	// printf("%-12s %-7s %-16s %-6s %-16s %-4s %7s %7s %7s\n", "TIME(ms)", "DEV", "COMM", "PID", "TYPE","SIZE(kb)","Q2I","I2C","LAT");
+	printf("%-13s %-6s %-16s %-6s %-16s %7s %7s\n", "TIME(ms)", "DEV", "COMM", "PID","TYPE   SIZE(kb)","Q2I(us)    I2C(us)","LAT(us)");
+}
+
+/*  When a new `bio` is submitted to the block layer (specifically the `bio` layer) by the filesystem. No request enqueued in
+ *  per-device queue yet (that's tracked by the "block_io_start" tracepoint, only available in 6.X kernel)
+ *  - format of tracepoint sudo cat /sys/kernel/tracing/events/block/block_bio_queue/format
+ */
+
+tracepoint:block:block_bio_queue
+{       
+        // filter for droplet processes (qemu, ...)
+        //if (strncmp(comm, "qemu-system-x86", 10) != 0 && strncmp(comm,"sh",4) != 0) {
+        //   return
+        //}
+
+   
+        // example: filter for vertain pid
+        //if (pid != 2643330) {
+        //  return
+        //}
+      
+           
+	@start[args->dev, args->sector] = nsecs;
+	@iopid[args->dev, args->sector] = pid;
+	@iocomm[args->dev, args->sector] = comm;
+}
+
+/* "block_rq_issue" tracepoint is used in kernel function "blk_mq_start_request" which is used by device drivers to notify the block layer that a request
+ * is going to be processed now (start executing, done queuing in on-device queue)
+* - via /@start[..]/ filters events that have no corresponding start-enrty in the bpf map
+* - sudo cat /sys/kernel/tracing/events/block/block_rq_issue/format
+*/
+
+tracepoint:block:block_rq_issue
+/@start[args->dev, args->sector]/
+{
+	@issue_time[args->dev, args->sector] = nsecs;
+}
+
+/*
+* "block_rq_complete" is a "request layer" tracepoint when the device marks the request as done
+* "block_bio_complete" is a "block layer" tracepoint when the filesystem marks the `bio` as done (should happen shortly after "block_rq_complete")
+* - not sure why the original author traces both events
+* - /@issue_time[..]/ filters events that have no corresponding issue (sanety check, as all completed I/Os should have been issued to the device at one point)
+* format of tracepoint: sudo cat /sys/kernel/tracing/events/block/block_bio_complete/format
+*/
+
+tracepoint:block:block_rq_complete,
+tracepoint:block:block_bio_complete
+/@issue_time[args->dev, args->sector]/
+{
+	printf("%-12u %4d:%-2d %-16s %-6d %-6s %llu   %10d %10d %10d\n",
+		elapsed / 1e6,
+		// like MAJOR(dev), MINOR(dev):
+		args->dev >> 20, args->dev & 0xfffff,
+		@iocomm[args->dev, args->sector],
+		@iopid[args->dev, args->sector],
+                args->rwbs,
+                (args->nr_sector*512)/1e3,
+                (@issue_time[args->dev, args->sector] - @start[args->dev, args->sector]) / 1e3,
+		(nsecs - @issue_time[args->dev, args->sector]) / 1e3,
+		(nsecs - @start[args->dev, args->sector]) / 1e3);
+
+	delete(@start[args->dev, args->sector]);
+	delete(@issue_time[args->dev, args->sector]);
+	delete(@iopid[args->dev, args->sector]);
+	delete(@iocomm[args->dev, args->sector]);
+}
+
+END
+{
+	clear(@start);
+	clear(@issue_time);
+	clear(@iopid);
+	clear(@iocomm);
+}
