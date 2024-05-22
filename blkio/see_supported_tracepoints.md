@@ -26,3 +26,7 @@ List of pre-defined events (to be used in -e):
   block:block_unplug                                 [Tracepoint eve>
 
 ```
+
+From reading the kernel code I THINK (not 100% sure), the temporal relationship of key tracepoints in the block I/O layer are depicted as below:
+
+![tracepoints.png](tracepoints.png)
