@@ -1,0 +1,187 @@
+#!/usr/bin/env bpftrace
+
+// bpftrace struct support: https://bpftrace.org/docs/release_023/language#structs
+
+#define BDRV_SECTOR_SIZE 512
+
+enum SCSIXferMode {
+    SCSI_XFER_NONE,      /*  TEST_UNIT_READY, ...            */
+    SCSI_XFER_FROM_DEV,  /*  READ, INQUIRY, MODE_SENSE, ...  */
+    SCSI_XFER_TO_DEV,    /*  WRITE, MODE_SELECT, ...         */
+};
+
+struct SCSICommand {
+    uint8_t buf[16];
+    int len;
+    size_t xfer;
+    uint64_t lba;
+    enum SCSIXferMode mode;
+}
+
+struct SCSIRequest {
+    void                *bus;
+    void                *dev;
+    const          void *ops;
+    void                *ctx;
+    uint32_t            refcount;
+    uint32_t            tag;
+    uint32_t            lun;
+    int16_t             status;
+    int16_t             host_status;
+    void                *hba_private;
+    uint64_t            residual;
+    struct SCSICommand  cmd;
+};
+
+struct QEMUIOVector {};
+struct BlockAcctCookie {};
+
+struct SCSIDiskReq {
+    struct SCSIRequest req;
+    uint64_t sector;
+    uint32_t sector_count;
+    uint32_t buflen;
+    bool started;
+    bool need_fua;
+    struct iovec iov;
+    struct QEMUIOVector qiov;
+    struct BlockAcctCookie acct;
+};
+
+// from: https://github.com/qemu/qemu/blob/master/hw/scsi/scsi-disk.c#L1854C9-L1860C2
+struct WriteSameCBData {
+    // we only care about the memory address here to match the request in the scsi_write_same_complete to the scsi_disk_emulate_write_same
+    struct SCSIDiskReq *r;
+    int64_t sector;
+    int nb_sectors;
+    struct QEMUIOVector qiov;
+    struct iovec iov;
+};
+
+
+BEGIN
+{
+  printf("Tracing SCSI write operations in QEMU...\n");
+}
+
+// `scsi_write_data` is called for writing DMA requests which includes WRITE_10,... (but excludes WRITE_SAME, SYNCHRONIZE, ...)
+// having a hard time to get the actual command from the buffer. Doesn't matter, I can directly see the
+// corresponding block requests when looking in the block layer
+uprobe:/usr/bin/qemu-system-x86_64:scsi_write_data.lto_priv.0
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  $command = (uint8) $scsi_request_ptr->cmd.buf[0];
+  $mode = (uint8) $scsi_request_ptr->cmd.mode;
+
+  @start_write[$scsi_request_ptr] = nsecs;
+  printf("WRITE: scsi_write_data.lto_priv.0 | time: %-8ld | ptr: %p  \n", nsecs / 1000000, $scsi_request_ptr);
+  // printf(" - Transfer Mode: %d (0=NONE, 1=TO_DEV, 2=FROM_DEV)\n", $mode);
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_read_data.lto_priv.0
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  $command = (uint8) $scsi_request_ptr->cmd.buf[0];
+  $mode = (uint8) $scsi_request_ptr->cmd.mode;
+
+  @start_read[$scsi_request_ptr] = nsecs;
+  printf("READ: scsi_read_data.lto_priv.0 | time: %-8ld | ptr: %p  \n", nsecs / 1000000, $scsi_request_ptr);
+  // printf(" - Transfer Mode: %d (0=NONE, 1=TO_DEV, 2=FROM_DEV)\n", $mode);
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_write_data.lto_priv.1
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  $command = *(uint8) $scsi_request_ptr->cmd.buf[0];
+
+  @start_write[$scsi_request_ptr] = nsecs;
+  printf("WRITE: scsi_write_data.lto_priv.1 | time: %-8ld \n", nsecs / 1000000);
+}
+
+
+// only called for non-DMA write operations (SYNC, TRIM, ...)
+uprobe:/usr/bin/qemu-system-x86_64:scsi_write_complete_noio
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  if (@start_write[$scsi_request_ptr] != 0) {
+    $delta = nsecs - @start_write[$scsi_request_ptr];
+    delete(@start_write[$scsi_request_ptr]);
+    printf("%-8ld | %-16s | PID: %-6d | TID: %d | took %lld nanoseconds (scsi_write_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $delta);
+  } else {
+    printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_write_complete_noio fired, but start time for %p not found! \n",
+           comm, pid, tid, $scsi_request_ptr);
+  }
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_dma_complete_noio
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+
+  // I can get the size of the request in the block layer, but that's not necessary for my latency measurements
+  // $scsi_disk_request = (struct SCSIDiskReq *) arg0;
+  // based on calculations in scsi_disk_dma_command https://github.com/qemu/qemu/blob/master/hw/scsi/scsi-disk.c#L2376
+  // TOOD: likely sometimes the structs filed sector size is simply not set, hence has random values in it (but once we get 4096)!
+  // $scsi_request_size = $scsi_disk_request->sector_count * BDRV_SECTOR_SIZE;
+  // $buf_hex_dump = buf($scsi_request_ptr->cmd.buf, 1);
+
+  if (@start_write[$scsi_request_ptr] != 0) {
+    $delta_ns = nsecs - @start_write[$scsi_request_ptr];
+
+    // Convert nanoseconds to milliseconds for the histogram
+    $delta_ms = $delta_ns / 1000000;
+
+    // Add the latency to the histogram
+    @write_latency_ms = hist($delta_ms);
+
+    // Add to the average calculation
+    @write_latency_ms_avg = avg($delta_ms);
+
+    delete(@start_write[$scsi_request_ptr]);
+    printf("%-8ld | %-16s | PID: %-6d | TID: %d | ptr: %p | took %lld ms (scsi_dma_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $scsi_request_ptr , $delta_ms);
+  } else {
+    if (@start_read[$scsi_request_ptr] != 0) {
+        $delta_ns = nsecs - @start_read[$scsi_request_ptr];
+        // Convert nanoseconds to milliseconds for the histogram
+        $delta_ms = $delta_ns / 1000000;
+
+        // Add the latency to the histogram
+        @read_latency_ms = hist($delta_ms);
+
+        // Add to the average calculation
+        @read_latency_ms_avg = avg($delta_ms);
+
+
+        delete(@start_read[$scsi_request_ptr]);
+        printf("%-8ld | %-16s | PID: %-6d | TID: %d | ptr: %p | took %lld ms (scsi_dma_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $scsi_request_ptr , $delta_ms);
+    } else {
+        printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_dma_complete_noio fired, but start time for %p not found! \n",
+               comm, pid, tid, $scsi_request_ptr);
+    }
+  }
+}
+
+// only called for non-DMA read operations (because there is a transfer direction for DMA requests)
+// - regular READ_10,.. are a DMA operation, hence won't be in here!
+uprobe:/usr/bin/qemu-system-x86_64:scsi_read_complete_noio
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+
+  if (@start_read[$scsi_request_ptr] != 0) {
+    $delta = nsecs - @start_read[$scsi_request_ptr];
+    delete(@start_read[$scsi_request_ptr]);
+    printf("%-8ld | %-16s | PID: %-6d | TID: %d | ptr: %p | took %lld nanoseconds (scsi_read_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $scsi_request_ptr , $delta);
+  } else {
+    printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_read_complete_noio fired, but start time for %p not found! \n",
+           comm, pid, tid, $scsi_request_ptr);
+  }
+}
+
+END
+{
+    printf("\n--------------------------------------------------------------------------------\n");
+    printf("Script ended. Checking for uncompleted SCSI operations...\n");
+    // Iterate over the @start map to find any entries that were not deleted
+    // (i.e., start events without a corresponding completion event)
+    printf("The following pointers had a start event but no corresponding completion:\n");
+    print(@start_write); // Print the map contents (TID: start_nsecs)
+}

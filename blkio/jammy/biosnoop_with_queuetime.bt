@@ -10,6 +10,22 @@
  * 15-Nov-2017	Brendan Gregg	Created this.
  * 21-May-2014  Daniel Foehr added calculation of time queued in the per-device I/O queue (Block I/O Wait Time) (Q2I) and time executing on-device (Service time) (I2C)
  *   - tested on Kernel 6.6.12
+
+
+TODO: bug: sometimes it seems like the program does noe record any more after a few seconds (does NOT happen with the original biosnoop).
+      Unclear why, might be related to the size of the @issue_time BPF map.
+
+NOTE: In `dd`, can use `oflag=direct` to bypass the page cache. Then we'll see the `dd` process show up in the trace 
+- otherwise will write to the page cache (buffer cache), which then uses regular flushes to the disk to write-out dirty pages 
+ - then `kworker/..` will show up as the process doing much of the I/O, which is misleading.
+ - often batched into larger I/O sizes by the kernel worker (which makes a lot of sense for performance)
+ - bypassing the page cache, we then see that actually 4096 bytes are written by `dd` each IO operation (how we wanted it)
+
+```
+sudo dd if=/dev/zero of=/var/lib/libvirt/images/remove_this bs=4k oflag=direct count=10000000
+```
+
+
  */
 
 

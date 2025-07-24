@@ -1,0 +1,113 @@
+#!/usr/bin/env bpftrace
+
+BEGIN
+{
+  printf("Tracing write operations in librbd...\n");
+}
+
+// rbd_aio_writev(s->image, qiov->iov, qiov->niov, offset, c);
+// arg4 is the struct I am looking for
+uprobe:/lib/librbd.so.1:rbd_aio_writev
+{
+  $opaque_callback_ptr = arg4;
+  @rbd_write[$opaque_callback_ptr] = nsecs;
+  printf("rbd_aio_writev | time: %-8ld | pid %d | tid %d | arg4: %p \n", nsecs / 1000000, pid, tid, $opaque_callback_ptr);
+}
+
+// rbd_aio_readv(s->image, qiov->iov, qiov->niov, offset, c)
+// arg4 is the struct I am looking for
+uprobe:/lib/librbd.so.1:rbd_aio_readv
+{
+  $opaque_callback_ptr = arg4;
+  @rbd_read[$opaque_callback_ptr] = nsecs;
+  printf("rbd_aio_readv | time: %-8ld | pid %d | tid %d | arg4: %p \n", nsecs / 1000000, pid, tid, $opaque_callback_ptr);
+}
+
+// rbd_aio_flush(s->image, c);
+uprobe:/lib/librbd.so.1:rbd_aio_flush
+{
+  $opaque_callback_ptr = arg1;
+  @rbd_flush[$opaque_callback_ptr] = nsecs;
+  printf("rbd_aio_flush | time: %-8ld | pid %d | tid %d | arg4: %p \n", nsecs / 1000000, pid, tid, $opaque_callback_ptr);
+}
+
+// rbd_aio_discard(s->image, offset, bytes, c);
+uprobe:/lib/librbd.so.1:rbd_aio_discard
+{
+  $opaque_callback_ptr = arg3;
+  @rbd_discard[$opaque_callback_ptr] = nsecs;
+  printf("rbd_aio_discard | time: %-8ld | pid %d | tid %d | arg4: %p \n", nsecs / 1000000, pid, tid, $opaque_callback_ptr);
+}
+
+// rbd_aio_write_zeroes(s->image, offset, bytes, c, zero_flags, 0)
+uprobe:/lib/librbd.so.1:rbd_aio_write_zeroes
+{
+  $opaque_callback_ptr = arg3;
+  @rbd_zeros[$opaque_callback_ptr] = nsecs;
+  printf("rbd_aio_write_zeroes | time: %-8ld | pid %d | tid %d | arg4: %p \n", nsecs / 1000000, pid, tid, $opaque_callback_ptr);
+}
+
+// static void qemu_rbd_completion_cb(rbd_completion_t c, RBDTask *task)
+uprobe:/usr/bin/qemu-system-x86_64:qemu_rbd_completion_cb
+{
+  $opaque_callback_ptr = arg0;
+
+  // TODO: check als read,flush,discard maps ....
+  if (@rbd_write[$opaque_callback_ptr] != 0) {
+        $delta_ns = nsecs - @rbd_write[$opaque_callback_ptr];
+        $delta_ms = $delta_ns / 1000000;
+        delete(@rbd_write[$opaque_callback_ptr]);
+        @write_latency_ms = hist($delta_ms);
+        @write_latency_ms_avg = avg($delta_ms);
+        printf("%-8ld | WRITE | PID: %-6d | TID: %d | took %lld ms\n", nsecs / 1000000, pid, tid, $delta_ms);
+        return;
+  } else if (@rbd_read[$opaque_callback_ptr] != 0) {
+        $delta_ns = nsecs - @rbd_read[$opaque_callback_ptr];
+        $delta_ms = $delta_ns / 1000000;
+        @read_latency_ms = hist($delta_ms);
+        @read_latency_ms_avg = avg($delta_ms);
+        delete(@rbd_read[$opaque_callback_ptr]);
+        printf("%-8ld | READ | PID: %-6d | TID: %d | took %lld ms\n", nsecs / 1000000, pid, tid, $delta_ms);
+        return;
+  } else if (@rbd_flush[$opaque_callback_ptr] != 0) {
+        $delta_ns = nsecs - @rbd_flush[$opaque_callback_ptr];
+        $delta_ms = $delta_ns / 1000000;
+        @flush_latency_ms = hist($delta_ms);
+        @flush_latency_ms_avg = avg($delta_ms);
+        delete(@rbd_flush[$opaque_callback_ptr]);
+        printf("%-8ld | FLUSH | PID: %-6d | TID: %d | took %lld ms\n", nsecs / 1000000, pid, tid, $delta_ms);
+        return;
+  } else if (@rbd_discard[$opaque_callback_ptr] != 0) {
+        $delta_ns = nsecs - @rbd_discard[$opaque_callback_ptr];
+        $delta_ms = $delta_ns / 1000000;
+        @discard_latency_ms = hist($delta_ms);
+        @discard_latency_ms_avg = avg($delta_ms);
+        delete(@rbd_discard[$opaque_callback_ptr]);
+        printf("%-8ld | DISCARD | PID: %-6d | TID: %d | took %lld ms\n", nsecs / 1000000, pid, tid, $delta_ms);
+        return;
+  }else if (@rbd_zeros[$opaque_callback_ptr] != 0) {
+           $delta_ns = nsecs - @rbd_zeros[$opaque_callback_ptr];
+           $delta_ms = $delta_ns / 1000000;
+           @zeros_latency_ms = hist($delta_ms);
+           @zeros_latency_ms_avg = avg($delta_ms);
+           delete(@rbd_zeros[$opaque_callback_ptr]);
+           printf("%-8ld | WRITE_ZEROS | PID: %-6d | TID: %d | took %lld ms\n", nsecs / 1000000, pid, tid, $delta_ms);
+           return;
+  } else {
+        // This block executes if @start[tid] is 0, meaning no corresponding start event was found.
+        printf("%-16s | qemu_rbd_completion_cb |  %p | WARNING: uprobe fired, but no start time found for r/w/d/f! \n",
+             comm, $opaque_callback_ptr);
+  }
+}
+
+// TODO: make histograms - but then that's all I wanted!!!
+END
+{
+    printf("\n--------------------------------------------------------------------------------\n");
+    printf("Script ended. Checking for uncompleted RBD operations...\n");
+    // Iterate over the @start map to find any entries that were not deleted
+    // (i.e., start events without a corresponding completion event)
+    //printf("The following TIDs had a start event but no corresponding completion:\n");
+    //print(@start); // Print the map contents (TID: start_nsecs)
+    printf("--------------------------------------------------------------------------------\n");
+}

@@ -1,0 +1,89 @@
+
+// static void scsi_disk_dma_command(SCSIRequest *req, uint8_t *buf)
+// SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
+// req->cmd.buf[0]
+uprobe:/usr/bin/qemu-system-x86_64:scsi_disk_dma_command
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  $command = $scsi_request_ptr->cmd.buf[0];
+  printf("START: scsi_disk_dma_command | time: %-8ld | pid %d | tid %d | ref: %p | cmd: %x \n", nsecs / 1000000, pid, tid, $scsi_request_ptr, $command);
+  @start2[$scsi_request_ptr] = nsecs;
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_disk_emulate_command
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  $command = $scsi_request_ptr->cmd.buf[0];
+  printf("START: scsi_disk_emulate_command | time: %-8ld | pid %d | tid %d | ref: %p | cmd: %x \n", nsecs / 1000000, pid, tid, $scsi_request_ptr, $command);
+  @start3[$scsi_request_ptr] = nsecs;
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_write_complete
+{
+  printf("START: scsi_write_complete | time: %-8ld | pid %d | tid %d \n", nsecs / 1000000, pid, tid);
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_req_complete
+{
+  printf("START: scsi_req_complete | time: %-8ld | pid %d | tid %d \n", nsecs / 1000000, pid, tid);
+}
+
+uprobe:/usr/bin/qemu-system-x86_64:scsi_aio_complete
+{
+  print(ustack);
+  printf("START: scsi_aio_complete | time: %-8ld | pid %d | tid %d \n", nsecs / 1000000, pid, tid);
+}
+
+
+// static void scsi_write_same_complete(void *opaque, int ret)
+uprobe:/usr/bin/qemu-system-x86_64:scsi_write_same_complete
+{
+  /*
+      WriteSameCBData *data = opaque;
+      SCSIDiskReq *r = data->r;
+      SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
+  */
+  $same_cbd_data_ptr = (struct WriteSameCBData *)arg0;
+  if (@start[$same_cbd_data_ptr] != 0) {
+        $delta = nsecs - @start[$same_cbd_data_ptr];
+        delete(@start[$same_cbd_data_ptr]);
+        printf("%-8ld | %-16s | PID: %-6d | TID: %d | took %lld nanoseconds\n", nsecs / 1000000, comm, pid, tid, $delta);
+  } else {
+        // This block executes if @start[tid] is 0, meaning no corresponding start event was found.
+        printf("%-16s | PID: %-6d | TID: %-10d | WARNING: uretprobe fired, but start time for %p not found! \n",
+             comm, pid, tid, $same_cbd_data_ptr);
+  }
+}
+
+// static void coroutine_fn blk_aio_write_entry(void *opaque)
+uprobe:/usr/bin/qemu-system-x86_64:blk_aio_write_entry.lto_priv.0
+{
+  $acb_ptr = (struct BlkAioEmAIOCB *) arg0;
+
+  @start[$acb_ptr] = nsecs;
+  printf("START: blk_aio_write_entry | time: %-8ld | acb_ptr: %p \n", nsecs / 1000000, $acb_ptr);
+}
+
+uretprobe:/usr/bin/qemu-system-x86_64:blk_aio_write_entry.lto_priv.0
+{
+  $acb_ptr = (struct BlkAioEmAIOCB *) arg0;
+
+  @start[$acb_ptr] = nsecs;
+  printf("START: blk_aio_write_entry | time: %-8ld | acb_ptr: %p \n", nsecs / 1000000, $acb_ptr);
+}
+
+
+// called when the SCSI SEND command is issued, that's why I always only saw the SEND command 0x2a
+// static int32_t scsi_disk_dma_command(SCSIRequest *req, uint8_t *buf)
+uprobe:/usr/bin/qemu-system-x86_64:scsi_disk_dma_command
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+
+  // arg1 holds the 'uint8_t *buf' pointer
+  $buf_ptr = arg1;
+  // Dereference the pointer to get the first byte
+  // Cast to (uint8 *) to ensure we read only 1 byte at that address
+  $command = *(uint8)$buf_ptr;
+
+  printf("START: scsi_disk_dma_command | time: %-8ld \n", nsecs / 1000000);
+}
