@@ -1,5 +1,9 @@
 #!/usr/bin/env bpftrace
 
+// all the RBD calls are made in `qemu_rbd_start_co` here: https://github.com/qemu/qemu/blob/master/block/rbd.c#L1275
+// - all async RBD I/O calls call the callback `qemu_rbd_completion_cb`: https://github.com/qemu/qemu/blob/master/block/rbd.c#L1267C13-L1267C35
+// --> also see the code comments for `qemu_rbd_completion_cb` that substantiate that: https://github.com/qemu/qemu/blob/master/block/rbd.c#L1262-L1266
+
 BEGIN
 {
   printf("Tracing write operations in librbd...\n");
@@ -52,7 +56,6 @@ uprobe:/usr/bin/qemu-system-x86_64:qemu_rbd_completion_cb
 {
   $opaque_callback_ptr = arg0;
 
-  // TODO: check als read,flush,discard maps ....
   if (@rbd_write[$opaque_callback_ptr] != 0) {
         $delta_ns = nsecs - @rbd_write[$opaque_callback_ptr];
         $delta_ms = $delta_ns / 1000000;
@@ -100,14 +103,8 @@ uprobe:/usr/bin/qemu-system-x86_64:qemu_rbd_completion_cb
   }
 }
 
-// TODO: make histograms - but then that's all I wanted!!!
 END
 {
     printf("\n--------------------------------------------------------------------------------\n");
     printf("Script ended. Checking for uncompleted RBD operations...\n");
-    // Iterate over the @start map to find any entries that were not deleted
-    // (i.e., start events without a corresponding completion event)
-    //printf("The following TIDs had a start event but no corresponding completion:\n");
-    //print(@start); // Print the map contents (TID: start_nsecs)
-    printf("--------------------------------------------------------------------------------\n");
 }

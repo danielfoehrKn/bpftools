@@ -1,7 +1,16 @@
 #!/usr/bin/env bpftrace
 
-// bpftrace struct support: https://bpftrace.org/docs/release_023/language#structs
+// NOTE: could only obtain read and write latency numbers for the SCSI layer (while on the RBD layer I could get also flush and discard).
+// - Reason: could not find good points in the QEMU source code to use to map a request to a completion callback.
+// - for read and write, they are mapped to DMA operations that have a clear entrypoint with the scsi_write_data and scsi_read_data functions and each call
+//   can be uniquely identified by the pointer to the SCSIRequest struct.
 
+// NOTE: you can get SCSI-level read/write/flush/discard latencies using QMP via e.g
+// - activate tracepoints and calculate histograms: sudo virsh qemu-monitor-command <guest-id> block-latency-histogram-set '{"id":"ua-ceph-<ceph_id>","boundaries":[1000000, 2000000, 4000000, 8000000, 16000000, 32000000, 64000000, 128000000, 256000000, 512000000, 1024000000]}'
+// - and then sudo virsh qemu-monitor-command <guest-id> query-blockstats | jq '.return[] | { qdev: .qdev, rd: .stats.rd_latency_histogram, wr: .stats.wr_latency_histogram, flush: .stats.flush_latency_histogram } | { qdev, rd: ([.rd.boundaries, .rd.bins] | transpose), wr: ([.wr.boundaries, .wr.bins] | transpose), flush: ([.flush.boundaries, .flush.bins] | transpose) }'
+// ---> I have done a comparison between the histogram calculated via QEMU internal tracepoints and this bpftrace code and found they match well.
+
+// bpftrace struct support: https://bpftrace.org/docs/release_023/language#structs
 #define BDRV_SECTOR_SIZE 512
 
 enum SCSIXferMode {
@@ -70,49 +79,28 @@ BEGIN
 uprobe:/usr/bin/qemu-system-x86_64:scsi_write_data.lto_priv.0
 {
   $scsi_request_ptr = (struct SCSIRequest *) arg0;
-  $command = (uint8) $scsi_request_ptr->cmd.buf[0];
-  $mode = (uint8) $scsi_request_ptr->cmd.mode;
 
   @start_write[$scsi_request_ptr] = nsecs;
-  printf("WRITE: scsi_write_data.lto_priv.0 | time: %-8ld | ptr: %p  \n", nsecs / 1000000, $scsi_request_ptr);
-  // printf(" - Transfer Mode: %d (0=NONE, 1=TO_DEV, 2=FROM_DEV)\n", $mode);
+  printf("WRITE: scsi_write_data.lto_priv.0 | time: %-8ld | ptr: %p \n", nsecs / 1000000, $scsi_request_ptr);
 }
 
 uprobe:/usr/bin/qemu-system-x86_64:scsi_read_data.lto_priv.0
 {
   $scsi_request_ptr = (struct SCSIRequest *) arg0;
-  $command = (uint8) $scsi_request_ptr->cmd.buf[0];
-  $mode = (uint8) $scsi_request_ptr->cmd.mode;
 
   @start_read[$scsi_request_ptr] = nsecs;
   printf("READ: scsi_read_data.lto_priv.0 | time: %-8ld | ptr: %p  \n", nsecs / 1000000, $scsi_request_ptr);
-  // printf(" - Transfer Mode: %d (0=NONE, 1=TO_DEV, 2=FROM_DEV)\n", $mode);
 }
 
 uprobe:/usr/bin/qemu-system-x86_64:scsi_write_data.lto_priv.1
 {
   $scsi_request_ptr = (struct SCSIRequest *) arg0;
-  $command = *(uint8) $scsi_request_ptr->cmd.buf[0];
 
   @start_write[$scsi_request_ptr] = nsecs;
   printf("WRITE: scsi_write_data.lto_priv.1 | time: %-8ld \n", nsecs / 1000000);
 }
 
-
-// only called for non-DMA write operations (SYNC, TRIM, ...)
-uprobe:/usr/bin/qemu-system-x86_64:scsi_write_complete_noio
-{
-  $scsi_request_ptr = (struct SCSIRequest *) arg0;
-  if (@start_write[$scsi_request_ptr] != 0) {
-    $delta = nsecs - @start_write[$scsi_request_ptr];
-    delete(@start_write[$scsi_request_ptr]);
-    printf("%-8ld | %-16s | PID: %-6d | TID: %d | took %lld nanoseconds (scsi_write_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $delta);
-  } else {
-    printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_write_complete_noio fired, but start time for %p not found! \n",
-           comm, pid, tid, $scsi_request_ptr);
-  }
-}
-
+// called from `scsi_write_data`: https://github.com/qemu/qemu/blob/master/hw/scsi/scsi-disk.c#L640
 uprobe:/usr/bin/qemu-system-x86_64:scsi_dma_complete_noio
 {
   $scsi_request_ptr = (struct SCSIRequest *) arg0;
@@ -138,25 +126,38 @@ uprobe:/usr/bin/qemu-system-x86_64:scsi_dma_complete_noio
 
     delete(@start_write[$scsi_request_ptr]);
     printf("%-8ld | %-16s | PID: %-6d | TID: %d | ptr: %p | took %lld ms (scsi_dma_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $scsi_request_ptr , $delta_ms);
+  } else if (@start_read[$scsi_request_ptr] != 0) {
+    $delta_ns = nsecs - @start_read[$scsi_request_ptr];
+    // Convert nanoseconds to milliseconds for the histogram
+    $delta_ms = $delta_ns / 1000000;
+
+    // Add the latency to the histogram
+    @read_latency_ms = hist($delta_ms);
+
+    // Add to the average calculation
+    @read_latency_ms_avg = avg($delta_ms);
+
+
+    delete(@start_read[$scsi_request_ptr]);
+    printf("%-8ld | %-16s | PID: %-6d | TID: %d | ptr: %p | took %lld ms (scsi_dma_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $scsi_request_ptr , $delta_ms);
   } else {
-    if (@start_read[$scsi_request_ptr] != 0) {
-        $delta_ns = nsecs - @start_read[$scsi_request_ptr];
-        // Convert nanoseconds to milliseconds for the histogram
-        $delta_ms = $delta_ns / 1000000;
+    printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_dma_complete_noio fired, but start time for %p not found! \n",
+           comm, pid, tid, $scsi_request_ptr);
+  }
+}
 
-        // Add the latency to the histogram
-        @read_latency_ms = hist($delta_ms);
-
-        // Add to the average calculation
-        @read_latency_ms_avg = avg($delta_ms);
-
-
-        delete(@start_read[$scsi_request_ptr]);
-        printf("%-8ld | %-16s | PID: %-6d | TID: %d | ptr: %p | took %lld ms (scsi_dma_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $scsi_request_ptr , $delta_ms);
-    } else {
-        printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_dma_complete_noio fired, but start time for %p not found! \n",
-               comm, pid, tid, $scsi_request_ptr);
-    }
+// TODO: below 2 functions are somehow not called, but I left them in here in case trim & flush support is to be investigated later
+// only called for non-DMA write operations (SYNC, TRIM, ...)
+uprobe:/usr/bin/qemu-system-x86_64:scsi_write_complete_noio
+{
+  $scsi_request_ptr = (struct SCSIRequest *) arg0;
+  if (@start_write[$scsi_request_ptr] != 0) {
+    $delta = nsecs - @start_write[$scsi_request_ptr];
+    delete(@start_write[$scsi_request_ptr]);
+    printf("%-8ld | %-16s | PID: %-6d | TID: %d | took %lld nanoseconds (scsi_write_complete_noio) \n", nsecs / 1000000, comm, pid, tid, $delta);
+  } else {
+    printf("%-16s | PID: %-6d | TID: %-10d | WARNING: scsi_write_complete_noio fired, but start time for %p not found! \n",
+           comm, pid, tid, $scsi_request_ptr);
   }
 }
 
