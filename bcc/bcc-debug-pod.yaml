@@ -1,0 +1,61 @@
+# tools are in /usr/share/bcc/tools
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dfoehr-bcc-debug-pod
+spec:
+  nodeName: gf7b5ac
+  
+  hostPID: true
+  hostNetwork: true
+  
+  containers:
+    - name: bcc-container
+      image: danielfoehrkn/ubuntu-bcc:v0.35.0
+      
+      stdin: true
+      tty: true
+      
+      # 4. Replicates the --privileged flag
+      securityContext:
+        privileged: true
+        
+      # 5. Volume Mounts (Replicates the -v flags)
+      volumeMounts:
+        # /lib/modules mount for kernel symbols/headers
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+        # /usr/src mount for kernel sources (needed by some BCC tools)
+        - name: usr-src
+          mountPath: /usr/src
+          readOnly: true
+        # /etc/localtime mount for consistent time zone
+        - name: etc-localtime
+          mountPath: /etc/localtime
+          readOnly: true
+        # /sys/kernel/debug mount for kernel debugging information
+        - name: sys-debug
+          mountPath: /sys/kernel/debug
+          readOnly: true
+          
+  # 6. Host Volumes definition
+  volumes:
+    - name: lib-modules
+      hostPath:
+        path: /lib/modules
+        type: Directory
+    - name: usr-src
+      hostPath:
+        path: /usr/src
+        type: Directory
+    - name: etc-localtime
+      hostPath:
+        path: /etc/localtime
+        # Use File type since it is a single file
+        type: File
+    - name: sys-debug
+      hostPath:
+        path: /sys/kernel/debug
+        type: Directory
+
